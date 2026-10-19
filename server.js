@@ -1,274 +1,128 @@
 const express = require('express');
 const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
+const crypto = require('node:crypto');
+const path = require('node:path');
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 5001;
-
-// Middleware
-app.use(cors());
-app.use(express.json());
-
-// Connect to SQLite database
-const db = new sqlite3.Database('./database.sqlite', (err) => {
-  if (err) {
-    console.error('Error connecting to database:', err.message);
-  } else {
-    console.log('Connected to the SQLite database');
-    
-    // Create tables if they don't exist
-    db.run(`CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT NOT NULL UNIQUE,
-      password TEXT NOT NULL,
-      email TEXT UNIQUE,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )`);
-    
-    db.run(`CREATE TABLE IF NOT EXISTS flight_bookings (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER,
-      from_location TEXT NOT NULL,
-      to_location TEXT NOT NULL,
-      departure_date TEXT NOT NULL,
-      return_date TEXT,
-      passengers INTEGER DEFAULT 1,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (user_id) REFERENCES users (id)
-    )`);
-    
-    db.run(`CREATE TABLE IF NOT EXISTS hotel_bookings (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER,
-      hotel_name TEXT NOT NULL,
-      location TEXT NOT NULL,
-      check_in_date TEXT NOT NULL,
-      check_out_date TEXT NOT NULL,
-      guests INTEGER DEFAULT 1,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (user_id) REFERENCES users (id)
-    )`);
-    
-    db.run(`CREATE TABLE IF NOT EXISTS contact_messages (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      email TEXT NOT NULL,
-      message TEXT NOT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )`);
+const port = Number(process.env.PORT || 5001);
+const db = new sqlite3.Database(process.env.DATABASE_PATH || path.join(__dirname, 'database.sqlite'));
+db.serialize(() => {
+  db.run('PRAGMA foreign_keys = ON');
+  db.run(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,
+    email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP)`);
+  db.run(`CREATE TABLE IF NOT EXISTS bookings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+    type TEXT NOT NULL CHECK(type IN ('hotel', 'flight')),
+    title TEXT NOT NULL, destination TEXT NOT NULL, start_date TEXT NOT NULL,
+    end_date TEXT, people INTEGER NOT NULL CHECK(people BETWEEN 1 AND 10),
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES users(id))`);
+});
+app.disable('x-powered-by');
+app.use(cors({ origin: process.env.CLIENT_ORIGIN || 'http://localhost:3000' }));
+app.use(express.json({ limit: '32kb' }));
+const query = (sql, params=[]) => new Promise((resolve,reject) =>
+  db.all(sql, params, (err, rows) => err ? reject(err) : resolve(rows)));
+const run = (sql, params=[]) => new Promise((resolve,reject) =>
+  db.run(sql, params, function(err) { err ? reject(err) : resolve(this.lastID); }));
+const secret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+if (!process.env.SESSION_SECRET) console.warn('SESSION_SECRET missing: sessions expire on restart. Configure it before deployment.');
+const sign = value => crypto.createHmac('sha256',secret).update(value).digest('base64url');
+function makeToken(user) {
+  const payload = Buffer.from(JSON.stringify({sub:user.id,exp:Date.now()+86400000})).toString('base64url');
+  return payload+'.'+sign(payload);
+}
+function auth(req,res,next) {
+  try {
+    const token = (req.headers.authorization || '').replace(/^Bearer /,'');
+    const [payload, signature] = token.split('.');
+    if (!payload || !signature) return res.status(401).json({error:'Sign in required'});
+    const expected = sign(payload);
+    if (signature.length !== expected.length ||
+        !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected)))
+      return res.status(401).json({error:'Invalid session'});
+    const data = JSON.parse(Buffer.from(payload,'base64url').toString('utf8'));
+    if (!Number.isSafeInteger(data.sub) || Date.now() > data.exp)
+      return res.status(401).json({error:'Session expired'});
+    req.userId = data.sub;
+    next();
+  } catch { res.status(401).json({error:'Invalid session'}); }
+}
+const clean = value => typeof value === 'string' ? value.trim() : '';
+const validDate = value => /^\d{4}-\d{2}-\d{2}$/.test(value) &&
+  !Number.isNaN(Date.parse(value)) && new Date(value+'T00:00:00Z').toISOString().slice(0,10) === value;
+const safe = fn => (req,res,next) => Promise.resolve(fn(req,res)).catch(next);
+app.get('/api/health', (_req,res) => res.json({status:'ok'}));
+app.post('/api/register', safe(async (req,res) => {
+  const username=clean(req.body.username), email=clean(req.body.email).toLowerCase();
+  const password=req.body.password;
+  if (!/^[a-zA-Z0-9_]{3,30}$/.test(username) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+      typeof password!=='string' || password.length<10 || password.length>128)
+    return res.status(400).json({error:'Use a 3–30 character username, valid email and password of 10–128 characters.'});
+  const salt=crypto.randomBytes(16).toString('hex');
+  const hash=salt+':'+crypto.scryptSync(password,salt,64).toString('hex');
+  try {
+    const id=await run('INSERT INTO users(username,email,password_hash) VALUES(?,?,?)',[username,email,hash]);
+    res.status(201).json({token:makeToken({id}),user:{id,username,email}});
+  } catch(e) {
+    if (e.code==='SQLITE_CONSTRAINT') return res.status(409).json({error:'Username or email already exists'});
+    throw e;
   }
+}));
+app.post('/api/login', safe(async (req,res) => {
+  const username=clean(req.body.username), password=req.body.password;
+  if (!username || typeof password!=='string') return res.status(400).json({error:'Credentials required'});
+  const [user]=await query('SELECT * FROM users WHERE username=?',[username]);
+  // Only password hashes are accepted; historical plaintext accounts require re-registration.
+  if (!user || !user.password_hash || !user.password_hash.includes(':'))
+    return res.status(401).json({error:'Invalid credentials'});
+  const [salt,expected]=user.password_hash.split(':');
+  const actual=crypto.scryptSync(password,salt,64);
+  const saved=Buffer.from(expected,'hex');
+  if (actual.length!==saved.length || !crypto.timingSafeEqual(actual,saved))
+    return res.status(401).json({error:'Invalid credentials'});
+  res.json({token:makeToken(user),user:{id:user.id,username:user.username,email:user.email}});
+}));
+app.get('/api/me',auth,safe(async(req,res)=>{
+  const [user]=await query('SELECT id,username,email FROM users WHERE id=?',[req.userId]);
+  if(!user) return res.status(401).json({error:'Account unavailable'});
+  res.json(user);
+}));
+const hotels=[
+  {id:1,name:'Delhi Heritage Stay',location:'New Delhi',price:6500},
+  {id:2,name:'Lakeview Retreat',location:'Udaipur',price:8200},
+  {id:3,name:'Himalayan Hideaway',location:'Shimla',price:7000},
+  {id:4,name:'Coastal Escape',location:'Goa',price:7800}
+];
+const destinations=['Delhi','Mumbai','Bengaluru','Chennai','Kolkata','Hyderabad','Jaipur','Goa','Kochi','Varanasi'].map((city,i)=>({id:i+1,city,country:'India'}));
+app.get('/api/hotels/list',(_req,res)=>res.json(hotels));
+app.get('/api/flights/destinations',(_req,res)=>res.json(destinations));
+app.get('/api/bookings',auth,safe(async(req,res)=>{
+  res.json(await query('SELECT id,type,title,destination,start_date,end_date,people,created_at FROM bookings WHERE user_id=? ORDER BY id DESC',[req.userId]));
+}));
+app.post('/api/bookings',auth,safe(async(req,res)=>{
+  const {type,people,start_date,end_date}=req.body;
+  const title=clean(req.body.title),destination=clean(req.body.destination);
+  if (!['hotel','flight'].includes(type) || !title || title.length>120 ||
+      !destination || destination.length>120 || !Number.isInteger(people) || people<1 || people>10 ||
+      !validDate(start_date) || (end_date && (!validDate(end_date) || end_date<start_date)))
+    return res.status(400).json({error:'Provide valid trip details and dates.'});
+  const id=await run('INSERT INTO bookings(user_id,type,title,destination,start_date,end_date,people) VALUES(?,?,?,?,?,?,?)',
+    [req.userId,type,title,destination,start_date,end_date||null,people]);
+  res.status(201).json({id,message:'Demo booking saved. No payment or external reservation was made.'});
+}));
+app.delete('/api/bookings/:id',auth,safe(async(req,res)=>{
+  if (!/^\d+$/.test(req.params.id)) return res.status(400).json({error:'Invalid booking ID'});
+  await run('DELETE FROM bookings WHERE id=? AND user_id=?',[Number(req.params.id),req.userId]);
+  res.status(204).end();
+}));
+app.use((err,_req,res,_next)=>{
+  console.error(err);
+  res.status(500).json({error:'Unexpected server error'});
 });
-
-// Routes
-// User Authentication
-app.post('/api/register', (req, res) => {
-  const { username, password, email } = req.body;
-  
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password are required' });
-  }
-  
-  const query = 'INSERT INTO users (username, password, email) VALUES (?, ?, ?)';
-  db.run(query, [username, password, email], function(err) {
-    if (err) {
-      return res.status(400).json({ error: err.message });
-    }
-    res.status(201).json({ id: this.lastID, username, message: 'User registered successfully' });
-  });
-});
-
-app.post('/api/login', (req, res) => {
-  const { username, password } = req.body;
-  
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password are required' });
-  }
-  
-  const query = 'SELECT * FROM users WHERE username = ? AND password = ?';
-  db.get(query, [username, password], (err, user) => {
-    if (err) {
-      return res.status(400).json({ error: err.message });
-    }
-    if (!user) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    res.json({ id: user.id, username: user.username, message: 'Login successful' });
-  });
-});
-
-// Flight Bookings
-app.post('/api/flights/book', (req, res) => {
-  const { user_id, from_location, to_location, departure_date, return_date, passengers } = req.body;
-  
-  const query = 'INSERT INTO flight_bookings (user_id, from_location, to_location, departure_date, return_date, passengers) VALUES (?, ?, ?, ?, ?, ?)';
-  db.run(query, [user_id, from_location, to_location, departure_date, return_date, passengers], function(err) {
-    if (err) {
-      return res.status(400).json({ error: err.message });
-    }
-    res.status(201).json({ id: this.lastID, message: 'Flight booked successfully' });
-  });
-});
-
-app.get('/api/flights/user/:userId', (req, res) => {
-  const userId = req.params.userId;
-  
-  const query = 'SELECT * FROM flight_bookings WHERE user_id = ? ORDER BY created_at DESC';
-  db.all(query, [userId], (err, bookings) => {
-    if (err) {
-      return res.status(400).json({ error: err.message });
-    }
-    res.json(bookings);
-  });
-});
-
-// Hotel Bookings
-app.post('/api/hotels/book', (req, res) => {
-  const { user_id, hotel_name, location, check_in_date, check_out_date, guests } = req.body;
-  
-  const query = 'INSERT INTO hotel_bookings (user_id, hotel_name, location, check_in_date, check_out_date, guests) VALUES (?, ?, ?, ?, ?, ?)';
-  db.run(query, [user_id, hotel_name, location, check_in_date, check_out_date, guests], function(err) {
-    if (err) {
-      return res.status(400).json({ error: err.message });
-    }
-    res.status(201).json({ id: this.lastID, message: 'Hotel booked successfully' });
-  });
-});
-
-app.get('/api/hotels/user/:userId', (req, res) => {
-  const userId = req.params.userId;
-  
-  const query = 'SELECT * FROM hotel_bookings WHERE user_id = ? ORDER BY created_at DESC';
-  db.all(query, [userId], (err, bookings) => {
-    if (err) {
-      return res.status(400).json({ error: err.message });
-    }
-    res.json(bookings);
-  });
-});
-
-// Contact Form
-app.post('/api/contact', (req, res) => {
-  const { name, email, message } = req.body;
-  
-  if (!name || !email || !message) {
-    return res.status(400).json({ error: 'All fields are required' });
-  }
-  
-  const query = 'INSERT INTO contact_messages (name, email, message) VALUES (?, ?, ?)';
-  db.run(query, [name, email, message], function(err) {
-    if (err) {
-      return res.status(400).json({ error: err.message });
-    }
-    res.status(201).json({ id: this.lastID, message: 'Message sent successfully' });
-  });
-});
-
-// Sample data for hotels
-app.get('/api/hotels/list', (req, res) => {
-  const hotels = [
-    {
-      id: 1,
-      name: 'Taj Palace',
-      location: 'New Delhi',
-      price: 12500,
-      rating: 4.8,
-      image: 'https://images.unsplash.com/photo-1566073771259-6a8506099945?ixlib=rb-1.2.1&auto=format&fit=crop&w=800&q=60'
-    },
-    {
-      id: 2,
-      name: 'Leela Palace',
-      location: 'Udaipur',
-      price: 18000,
-      rating: 4.9,
-      image: 'https://images.unsplash.com/photo-1582719508461-905c673771fd?ixlib=rb-1.2.1&auto=format&fit=crop&w=800&q=60'
-    },
-    {
-      id: 3,
-      name: 'Wildflower Hall',
-      location: 'Shimla',
-      price: 15000,
-      rating: 4.7,
-      image: 'https://images.unsplash.com/photo-1551882547-ff40c63fe5fa?ixlib=rb-1.2.1&auto=format&fit=crop&w=800&q=60'
-    },
-    {
-      id: 4,
-      name: 'Taj Mahal Palace',
-      location: 'Mumbai',
-      price: 16500,
-      rating: 4.8,
-      image: 'https://images.unsplash.com/photo-1596386461350-326ccb383e9f?ixlib=rb-1.2.1&auto=format&fit=crop&w=800&q=60'
-    },
-    {
-      id: 5,
-      name: 'Kumarakom Lake Resort',
-      location: 'Kerala',
-      price: 14000,
-      rating: 4.6,
-      image: 'https://images.unsplash.com/photo-1580977276076-ae4b8c219b8e?ixlib=rb-1.2.1&auto=format&fit=crop&w=800&q=60'
-    },
-    {
-      id: 6,
-      name: 'Oberoi Amarvilas',
-      location: 'Agra',
-      price: 19500,
-      rating: 4.9,
-      image: 'https://images.unsplash.com/photo-1564501049412-61c2a3083791?ixlib=rb-1.2.1&auto=format&fit=crop&w=800&q=60'
-    },
-    {
-      id: 7,
-      name: 'Rambagh Palace',
-      location: 'Jaipur',
-      price: 17500,
-      rating: 4.8,
-      image: 'https://images.unsplash.com/photo-1571896349842-33c89424de2d?ixlib=rb-1.2.1&auto=format&fit=crop&w=800&q=60'
-    },
-    {
-      id: 8,
-      name: 'Taj Falaknuma Palace',
-      location: 'Hyderabad',
-      price: 18500,
-      rating: 4.7,
-      image: 'https://images.unsplash.com/photo-1542314831-068cd1dbfeeb?ixlib=rb-1.2.1&auto=format&fit=crop&w=800&q=60'
-    }
-  ];
-  
-  res.json(hotels);
-});
-
-// Sample data for flights
-app.get('/api/flights/destinations', (req, res) => {
-  const destinations = [
-    { id: 1, city: 'Delhi', country: 'India', code: 'DEL' },
-    { id: 2, city: 'Mumbai', country: 'India', code: 'BOM' },
-    { id: 3, city: 'Bangalore', country: 'India', code: 'BLR' },
-    { id: 4, city: 'Chennai', country: 'India', code: 'MAA' },
-    { id: 5, city: 'Kolkata', country: 'India', code: 'CCU' },
-    { id: 6, city: 'Hyderabad', country: 'India', code: 'HYD' },
-    { id: 7, city: 'Jaipur', country: 'India', code: 'JAI' },
-    { id: 8, city: 'Goa', country: 'India', code: 'GOI' },
-    { id: 9, city: 'Kochi', country: 'India', code: 'COK' },
-    { id: 10, city: 'Varanasi', country: 'India', code: 'VNS' },
-    { id: 11, city: 'Amritsar', country: 'India', code: 'ATQ' },
-    { id: 12, city: 'Ahmedabad', country: 'India', code: 'AMD' }
-  ];
-  
-  res.json(destinations);
-});
-
-// Start the server
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
-
-// Close the database connection when the server is terminated
-process.on('SIGINT', () => {
-  db.close((err) => {
-    if (err) {
-      console.error(err.message);
-    }
-    console.log('Database connection closed');
-    process.exit(0);
-  });
-});
+if (require.main===module) app.listen(port,()=>console.log('API listening on '+port));
+module.exports=app;
