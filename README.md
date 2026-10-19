@@ -1,70 +1,72 @@
-# Getting Started with Create React App
+# Smart Travel — Full-stack travel planning demo
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+React 19 + Express 5 + SQLite web application demonstrating account registration, sign-in, destination discovery and **demo** travel bookings.
 
-## Available Scripts
+> **Portfolio/demo scope:** No airline, hotel, payment provider, AI model or live inventory is connected. Booking records are stored only in this application's SQLite database; they do not constitute real reservations.
 
-In the project directory, you can run:
+## Features
+- React frontend with responsive pages for sign-in, registration, destinations and bookings
+- Express REST API with request validation and consistent JSON errors
+- Per-user bookings protected by signed, expiring bearer tokens
+- Passwords hashed using Node.js scrypt with individual random salts
+- SQLite persistence for accounts and example bookings
+- Health endpoint and deterministic sample listings
 
-### `npm start`
+## Quick start
 
-Runs the app in the development mode.\
-Open [http://localhost:3000](http://localhost:3000) to view it in your browser.
+Requires Node.js 20+.
 
-The page will reload when you make changes.\
-You may also see any lint errors in the console.
+```bash
+npm ci
+cp .env.example .env
+# Set a long random SESSION_SECRET in .env, e.g. with node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
+npm run dev
+```
 
-### `npm test`
+Frontend: http://localhost:3000 | API: http://localhost:5001
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+If your React dev server runs at another address, update CLIENT_ORIGIN. Do not commit .env or database.sqlite.
 
-### `npm run build`
+## Environment
+See [`.env.example`](.env.example). The API does not require a Gemini key.
 
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
+## API
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | /api/health | API health |
+| POST | /api/register | Create account |
+| POST | /api/login | Sign in |
+| GET | /api/me | Current user (bearer token) |
+| GET | /api/hotels/list | Sample hotel catalog |
+| GET | /api/flights/destinations | Sample destinations |
+| GET | /api/bookings | My bookings (bearer token) |
+| POST | /api/bookings | Save demo booking (bearer token) |
+| DELETE | /api/bookings/:id | Delete my booking (bearer token) |
 
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
+## Architecture
 
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+```text
+src/               React UI and API client
+public/            HTML entry point
+server.js          Express API, validation, auth and SQLite persistence
+database.sqlite    Local runtime DB (not version-controlled)
+.env.example       Environment variable names, no secrets
+```
 
-### `npm run eject`
+## Security and limitations
+- The old repository history included a public Gemini API key. **Revoke/rotate that key immediately**; deleting a tracked file does not erase git history.
+- Legacy demo accounts using plaintext passwords are not migrated; create a fresh account after this change.
+- No email verification, password reset, rate limiting, production session revocation or abuse protection. Do not deploy this demo publicly without these protections and an operational security review.
+- Tokens are stored in browser sessionStorage for this demo; production authentication should prefer hardened HttpOnly secure cookies and CSRF protection.
+- Example travel listings are fictional and prices are illustrative.
+- The frontend and API need CI checks and end-to-end browser testing before production.
+- If a previous SQLite DB contained real data, back it up securely before migration.
 
-**Note: this is a one-way operation. Once you `eject`, you can't go back!**
+## Next milestones
+1. Add integration tests using temporary databases, with isolated test secrets.
+2. Add paginated search/filtering, booking detail and cancellation flows.
+3. Add deployment, CI and screenshots of verified screens.
+4. Integrate a real provider only with an approved backend contract and protected credentials.
 
-If you aren't satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
-
-Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you're on your own.
-
-You don't have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn't feel obligated to use this feature. However we understand that this tool wouldn't be useful if you couldn't customize it when you are ready for it.
-
-## Learn More
-
-You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
-
-To learn React, check out the [React documentation](https://reactjs.org/).
-
-### Code Splitting
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/code-splitting](https://facebook.github.io/create-react-app/docs/code-splitting)
-
-### Analyzing the Bundle Size
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size](https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size)
-
-### Making a Progressive Web App
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app](https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app)
-
-### Advanced Configuration
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/advanced-configuration](https://facebook.github.io/create-react-app/docs/advanced-configuration)
-
-### Deployment
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/deployment](https://facebook.github.io/create-react-app/docs/deployment)
-
-### `npm run build` fails to minify
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify](https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify)
+## Resume description
+**Full-stack Travel Planning Demo** — Built a React/Express/SQLite application with authenticated per-user demo bookings, input validation and responsive travel discovery screens. Implemented salted password hashing and scoped REST endpoints. This project **does not process real bookings**.
